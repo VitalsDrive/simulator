@@ -1,5 +1,4 @@
 import * as net from 'net';
-import * as struct from 'struct';
 
 interface SimulatorConfig {
   host: string;
@@ -140,10 +139,11 @@ class GhostFleetSimulator {
     payload.writeUInt16LE(crc, 14);
 
     // Build complete packet
+    // Total: 2 (start) + 1 (length) + 1 (protocol) + 17 (payload) + 2 (stop) = 23
     const packet = Buffer.alloc(23);
     packet[0] = 0x78;
     packet[1] = 0x78;
-    packet[2] = payload.length + 1;  // payload + protocol byte
+    packet[2] = payload.length;  // 17 = payload length (protocol is separate)
     packet[3] = 0x22;  // Data packet protocol
     payload.copy(packet, 4);
     packet[21] = 0x0D;
