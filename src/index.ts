@@ -4,6 +4,7 @@ interface SimulatorConfig {
   host: string;
   port: number;
   vehicleId: string;
+  imei: string;
   intervalMs: number;
   latitude: number;
   longitude: number;
@@ -16,12 +17,28 @@ interface SimulatedData {
   voltage: number;
   temp: number;
   rpm: number;
-  dtcCodes: string[];
+}
+
+// CRC-16-IBM (polynomial 0x1021, initial 0x0000)
+function crc16(data: Buffer): number {
+  let crc = 0x0000;
+  for (let i = 0; i < data.length; i++) {
+    crc ^= data[i] << 8;
+    for (let j = 0; j < 8; j++) {
+      if (crc & 0x8000) {
+        crc = (crc << 1) ^ 0x1021;
+      } else {
+        crc = crc << 1;
+      }
+    }
+  }
+  return crc & 0xFFFF;
 }
 
 class GhostFleetSimulator {
   private config: SimulatorConfig;
   private running = false;
+  private authenticated = false;
 
   constructor(config: SimulatorConfig) {
     this.config = config;
@@ -30,7 +47,7 @@ class GhostFleetSimulator {
   start(): void {
     this.running = true;
     this.runSimulation();
-    console.log(`Ghost Fleet simulator started for vehicle: ${this.config.vehicleId}`);
+    console.log(`Ghost Fleet simulator started for vehicle: ${this.config.vehicleId} (IMEI: ${this.config.imei})`);
   }
 
   stop(): void {
@@ -41,53 +58,100 @@ class GhostFleetSimulator {
   private runSimulation(): void {
     if (!this.running) return;
 
-    const data = this.generateSimulatedData();
-    const packet = this.buildPacket(data);
-
     const client = new net.Socket();
+    let ackBuffer = Buffer.alloc(0);
 
     client.connect(this.config.port, this.config.host, () => {
-      client.write(packet);
-      console.log(`[${this.config.vehicleId}] Sent packet: ${packet.toString('hex')}`);
-      client.end();
+      // Send raw IMEI (15 ASCII digits, no framing)
+      client.write(Buffer.from(this.config.imei, 'ascii'));
+      console.log(`[${this.config.vehicleId}] Sent IMEI: ${this.config.imei}`);
+    });
+
+    client.on('data', (chunk: Buffer) => {
+      if (!this.authenticated) {
+        // Expect single byte 0x01 as login ACK
+        if (chunk.length > 0 && chunk[0] === 0x01) {
+          this.authenticated = true;
+          console.log(`[${this.config.vehicleId}] Authenticated successfully`);
+          // Send first telemetry
+          const data = this.generateSimulatedData();
+          const packet = this.buildCodec8ExtendedPacket(data);
+          client.write(packet);
+          console.log(`[${this.config.vehicleId}] Sent telemetry: ${packet.toString('hex').substring(0, 60)}...`);
+        } else {
+          console.error(`[${this.config.vehicleId}] Auth failed: ${chunk.toString('hex')}`);
+          client.end();
+        }
+        return;
+      }
+
+      // Accumulate ACK responses (4 bytes big-endian record count)
+      ackBuffer = Buffer.concat([ackBuffer, chunk]);
+      while (ackBuffer.length >= 4) {
+        const recordCount = ackBuffer.readUInt32BE(0);
+        console.log(`[${this.config.vehicleId}] Server ACK: ${recordCount} records confirmed`);
+        ackBuffer = ackBuffer.slice(4);
+      }
     });
 
     client.on('close', () => {
-      // Schedule next transmission
-      setTimeout(() => this.runSimulation(), this.config.intervalMs);
+      if (this.running) {
+        console.log(`[${this.config.vehicleId}] Connection closed, reconnecting...`);
+        this.authenticated = false;
+        setTimeout(() => this.runSimulation(), this.config.intervalMs);
+      }
     });
 
     client.on('error', (err) => {
       console.error(`[${this.config.vehicleId}] Connection error:`, err.message);
-      setTimeout(() => this.runSimulation(), this.config.intervalMs);
+      if (this.running) {
+        setTimeout(() => this.runSimulation(), this.config.intervalMs);
+      }
     });
+
+    // Schedule next telemetry at interval
+    const scheduleNext = () => {
+      if (!this.running || !this.authenticated) return;
+
+      setTimeout(() => {
+        if (!this.running || !this.authenticated) return;
+        const data = this.generateSimulatedData();
+        const packet = this.buildCodec8ExtendedPacket(data);
+        client.write(packet);
+        console.log(`[${this.config.vehicleId}] Sent telemetry: temp=${data.temp}°C, voltage=${data.voltage}V, rpm=${data.rpm}, speed=${data.speed}km/h`);
+        scheduleNext();
+      }, this.config.intervalMs);
+    };
+
+    // Wait for auth before scheduling
+    const waitForAuth = setInterval(() => {
+      if (this.authenticated) {
+        clearInterval(waitForAuth);
+        scheduleNext();
+      }
+      if (!this.running) {
+        clearInterval(waitForAuth);
+      }
+    }, 100);
   }
 
   private generateSimulatedData(): SimulatedData {
-    // Base values with some variation
     const baseLat = this.config.latitude;
     const baseLng = this.config.longitude;
 
-    // Random scenario selection
     const scenario = Math.random();
-    let temp = 85 + Math.random() * 10;  // Normal: 85-95°C
-    let voltage = 12.4 + Math.random() * 0.8;  // Normal: 12.4-13.2V
-    let rpm = 1500 + Math.random() * 1500;  // Normal: 1500-3000
-    const dtcCodes: string[] = [];
+    let temp = 85 + Math.random() * 10; // Normal: 85-95°C
+    let voltage = 12.4 + Math.random() * 0.8; // Normal: 12.4-13.2V
+    let rpm = 1500 + Math.random() * 1500; // Normal: 1500-3000
 
     // 10% chance of overheating
     if (scenario < 0.1) {
-      temp = 105 + Math.random() * 5;  // Hot: 105-110°C
+      temp = 105 + Math.random() * 5; // Hot: 105-110°C
     }
 
     // 5% chance of low battery
     if (scenario > 0.9) {
-      voltage = 11.5 + Math.random() * 0.5;  // Low: 11.5-12.0V
-    }
-
-    // 2% chance of DTC
-    if (scenario > 0.98) {
-      dtcCodes.push('P0420');  // Catalyst efficiency
+      voltage = 11.5 + Math.random() * 0.5; // Low: 11.5-12.0V
     }
 
     return {
@@ -96,60 +160,85 @@ class GhostFleetSimulator {
       speed: Math.floor(30 + Math.random() * 50),
       voltage,
       temp: Math.floor(temp),
-      rpm: Math.floor(rpm),
-      dtcCodes
+      rpm: Math.floor(rpm)
     };
   }
 
-  private buildPacket(data: SimulatedData): Buffer {
-    // Protocol: SinoTrack/Micodus
-    // [0-1] Start: 0x78 0x78
-    // [2] Length
-    // [3] Protocol: 0x22 (data)
-    // [4-7] Latitude (int32, little endian, degrees * 1e6)
-    // [8-11] Longitude (int32, little endian, degrees * 1e6)
-    // [12] Speed (uint8, km/h)
-    // [13-14] Voltage (uint16, little endian, mV)
-    // [15] Temp (uint8, °C)
-    // [16-17] RPM (uint16, little endian)
-    // [18-19] CRC (uint16, little endian)
-    // [20-21] Stop: 0x0D 0x0A
-
-    const latInt = Math.floor(data.lat * 1_000_000);
-    const lngInt = Math.floor(data.lng * 1_000_000);
+  private buildCodec8ExtendedPacket(data: SimulatedData): Buffer {
+    const timestamp = BigInt(Date.now());
+    const latInt = Math.floor(data.lat * 10_000_000);
+    const lngInt = Math.floor(data.lng * 10_000_000);
+    const speedInt = data.speed * 10; // km/h × 10
     const voltageMv = Math.floor(data.voltage * 1000);
-    const rpmInt = Math.floor(data.rpm);
+    const tempX10 = Math.floor(data.temp * 10);
 
-    // Build payload (without start/stop bytes)
-    const payload = Buffer.alloc(17);
-    payload.writeInt32LE(latInt, 0);
-    payload.writeInt32LE(lngInt, 4);
-    payload.writeUInt8(data.speed, 8);
-    payload.writeUInt16LE(voltageMv, 9);
-    payload.writeUInt8(data.temp, 11);
-    payload.writeUInt16LE(rpmInt, 12);
-    payload.writeUInt16LE(0, 14); // CRC placeholder
+    // Build IO elements
+    const ioElements: Buffer[] = [];
 
-    // Calculate CRC (sum of bytes after length byte)
-    let crc = 0;
-    for (let i = 0; i < payload.length; i++) {
-      crc += payload[i];
-    }
-    crc &= 0xFFFF;
-    payload.writeUInt16LE(crc, 14);
+    // IO ID 5: Speed (type 1 = uint8)
+    ioElements.push(Buffer.from([0x00, 0x05, 0x01, data.speed]));
 
-    // Build complete packet
-    // Total: 2 (start) + 1 (length) + 1 (protocol) + 17 (payload) + 2 (stop) = 23
-    const packet = Buffer.alloc(23);
-    packet[0] = 0x78;
-    packet[1] = 0x78;
-    packet[2] = payload.length;  // 17 = payload length (protocol is separate)
-    packet[3] = 0x22;  // Data packet protocol
-    payload.copy(packet, 4);
-    packet[21] = 0x0D;
-    packet[22] = 0x0A;
+    // IO ID 67: Battery Voltage (type 2 = uint16 BE, mV)
+    const voltBuf = Buffer.alloc(4);
+    voltBuf.writeUInt16BE(67, 0);
+    voltBuf[2] = 0x02;
+    voltBuf.writeUInt16BE(voltageMv, 3);
+    ioElements.push(voltBuf);
 
-    return packet;
+    // IO ID 128: Engine Temperature (type 2 = uint16 BE, °C×10)
+    const tempBuf = Buffer.alloc(4);
+    tempBuf.writeUInt16BE(128, 0);
+    tempBuf[2] = 0x02;
+    tempBuf.writeUInt16BE(tempX10, 3);
+    ioElements.push(tempBuf);
+
+    // IO ID 179: Engine RPM (type 3 = uint32 BE)
+    const rpmBuf = Buffer.alloc(6);
+    rpmBuf.writeUInt16BE(179, 0);
+    rpmBuf[2] = 0x03;
+    rpmBuf.writeUInt32BE(data.rpm, 3);
+    ioElements.push(rpmBuf);
+
+    const ioData = Buffer.concat(ioElements);
+    const ioCount = 4; // number of IO elements
+
+    // Fixed AVL record (28 bytes)
+    const avlFixed = Buffer.alloc(29);
+    avlFixed.writeBigUInt64BE(timestamp, 0);
+    avlFixed[8] = 0; // priority
+    avlFixed.writeInt32BE(lngInt, 9);
+    avlFixed.writeInt32BE(latInt, 13);
+    avlFixed.writeInt16BE(0, 17); // altitude
+    avlFixed.writeUInt16BE(0, 19); // angle
+    avlFixed.writeUInt16BE(8, 21); // satellites
+    avlFixed.writeUInt16BE(speedInt, 23);
+    avlFixed.writeUInt16BE(0, 25); // event ID
+    avlFixed.writeUInt16BE(ioCount, 27);
+
+    const avlRecord = Buffer.concat([avlFixed, ioData]);
+
+    // Build payload: codec ID + num records + AVL records + num records repeat
+    const header = Buffer.alloc(3);
+    header[0] = 0x8E; // codec ID
+    header.writeUInt16BE(1, 1); // num records
+
+    const trailer = Buffer.alloc(2);
+    trailer.writeUInt16BE(1, 0); // num records repeat
+
+    const payload = Buffer.concat([header, avlRecord, trailer]);
+
+    // CRC-16 over payload
+    const crc = crc16(payload);
+    const crcBuf = Buffer.alloc(2);
+    crcBuf.writeUInt16BE(crc, 0);
+
+    // Full packet: preamble + length + payload + CRC
+    const preamble = Buffer.from([0x00, 0x00, 0x00, 0x00]);
+    const dataLength = payload.length + 2; // payload + CRC
+    const lengthBuf = Buffer.alloc(4);
+    lengthBuf.writeUInt32BE(dataLength, 0);
+
+    return Buffer.concat([preamble, lengthBuf, payload, crcBuf]);
   }
 }
 
@@ -158,6 +247,7 @@ const config: SimulatorConfig = {
   host: process.env.PARSER_HOST || 'localhost',
   port: parseInt(process.env.PARSER_PORT || '5050', 10),
   vehicleId: process.env.VEHICLE_ID || 'ghost-vehicle-01',
+  imei: process.env.DEVICE_IMEI || '359632098765432',
   intervalMs: parseInt(process.env.SEND_INTERVAL_MS || '5000', 10),
   latitude: parseFloat(process.env.LATITUDE || '37.7749'),
   longitude: parseFloat(process.env.LONGITUDE || '-122.4194')
