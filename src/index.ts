@@ -196,29 +196,29 @@ class GhostFleetSimulator {
     // Build IO elements
     const ioElements: Buffer[] = [];
 
-    // IO ID 7045: Vehicle Speed (type 2 = uint16 BE, km/h)
-    const speedBuf = Buffer.alloc(4);
+    // IO ID 7045: Vehicle Speed (type 2 = uint16 BE, km/h) — 2(ID)+1(type)+2(val)=5 bytes
+    const speedBuf = Buffer.alloc(5);
     speedBuf.writeUInt16BE(7045, 0);
     speedBuf[2] = 0x02;
     speedBuf.writeUInt16BE(data.speed, 3);
     ioElements.push(speedBuf);
 
-    // IO ID 7059: Control Voltage (type 2 = uint16 BE, mV)
-    const voltBuf = Buffer.alloc(4);
+    // IO ID 7059: Control Voltage (type 2 = uint16 BE, mV) — 5 bytes
+    const voltBuf = Buffer.alloc(5);
     voltBuf.writeUInt16BE(7059, 0);
     voltBuf[2] = 0x02;
     voltBuf.writeUInt16BE(voltageMv, 3);
     ioElements.push(voltBuf);
 
-    // IO ID 7040: Coolant Temperature (type 2 = uint16 BE, °C×10)
-    const tempBuf = Buffer.alloc(4);
+    // IO ID 7040: Coolant Temperature (type 2 = uint16 BE, °C×10) — 5 bytes
+    const tempBuf = Buffer.alloc(5);
     tempBuf.writeUInt16BE(7040, 0);
     tempBuf[2] = 0x02;
     tempBuf.writeUInt16BE(tempX10, 3);
     ioElements.push(tempBuf);
 
-    // IO ID 7044: Engine RPM (type 3 = uint32 BE)
-    const rpmBuf = Buffer.alloc(6);
+    // IO ID 7044: Engine RPM (type 3 = uint32 BE) — 2(ID)+1(type)+4(val)=7 bytes
+    const rpmBuf = Buffer.alloc(7);
     rpmBuf.writeUInt16BE(7044, 0);
     rpmBuf[2] = 0x03;
     rpmBuf.writeUInt32BE(data.rpm, 3);
