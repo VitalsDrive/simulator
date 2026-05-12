@@ -1,4 +1,6 @@
-import * as net from 'net';
+import * as dotenv from 'dotenv';
+dotenv.config();
+import * as net from "net";
 
 interface SimulatorConfig {
   host: string;
@@ -21,20 +23,32 @@ interface SimulatedData {
   rpm: number;
 }
 
-// CRC-16-IBM (polynomial 0x1021, initial 0x0000)
+// CRC-16/IBM (polynomial 0x8005, reflected input/output, initial 0x0000)
 function crc16(data: Buffer): number {
   let crc = 0x0000;
   for (let i = 0; i < data.length; i++) {
-    crc ^= data[i] << 8;
+    crc ^= data[i];
     for (let j = 0; j < 8; j++) {
-      if (crc & 0x8000) {
-        crc = (crc << 1) ^ 0x1021;
+      if (crc & 1) {
+        crc = (crc >>> 1) ^ 0xA001;
       } else {
-        crc = crc << 1;
+        crc = crc >>> 1;
       }
     }
   }
   return crc & 0xFFFF;
+}
+
+function requireInt(val: string | undefined, def: number, name: string): number {
+  const parsed = parseInt(val ?? String(def), 10);
+  if (isNaN(parsed)) throw new Error(`${name}: expected integer, got "${val}"`);
+  return parsed;
+}
+
+function requireFloat(val: string | undefined, def: number, name: string): number {
+  const parsed = parseFloat(val ?? String(def));
+  if (isNaN(parsed)) throw new Error(`${name}: expected number, got "${val}"`);
+  return parsed;
 }
 
 let sessionCount = 0;
@@ -51,44 +65,50 @@ class GhostFleetSimulator {
   start(): void {
     this.running = true;
     this.runSimulation();
-    console.log(`Ghost Fleet simulator started for vehicle: ${this.config.vehicleId} (IMEI: ${this.config.imei})`);
+    console.log(
+      `Ghost Fleet simulator started for vehicle: ${this.config.vehicleId} (IMEI: ${this.config.imei})`,
+    );
   }
 
   stop(): void {
     this.running = false;
-    console.log('Ghost Fleet simulator stopped');
+    console.log("Ghost Fleet simulator stopped");
   }
 
   private runSimulation(): void {
     if (!this.running) return;
 
-    sessionCount++;
-    const { reconnectTest, packetsPerSession, vehicleId, intervalMs } = this.config;
+    const { reconnectTest, packetsPerSession, vehicleId, intervalMs } =
+      this.config;
 
     const client = new net.Socket();
     let ackBuffer = Buffer.alloc(0);
     let packetsSentThisSession = 0;
+    let sessionActive = true;
 
     client.connect(this.config.port, this.config.host, () => {
       // Send raw IMEI (15 ASCII digits, no framing)
-      client.write(Buffer.from(this.config.imei, 'ascii'));
+      client.write(Buffer.from(this.config.imei, "ascii"));
       console.log(`[${vehicleId}] Sent IMEI: ${this.config.imei}`);
     });
 
-    client.on('data', (chunk: Buffer) => {
+    client.on("data", (chunk: Buffer) => {
       if (!this.authenticated) {
         // Expect single byte 0x01 as login ACK
         if (chunk.length > 0 && chunk[0] === 0x01) {
           this.authenticated = true;
+          sessionCount++;
           console.log(`[${vehicleId}] Authenticated successfully`);
           // Send first telemetry
           const data = this.generateSimulatedData();
           const packet = this.buildCodec8ExtendedPacket(data);
           client.write(packet);
           packetsSentThisSession++;
-          console.log(`[${vehicleId}] Sent telemetry: temp=${data.temp}°C, voltage=${data.voltage}V, rpm=${data.rpm}, speed=${data.speed}km/h`);
+          console.log(
+            `[${vehicleId}] Sent telemetry: temp=${data.temp}°C, voltage=${data.voltage}V, rpm=${data.rpm}, speed=${data.speed}km/h`,
+          );
         } else {
-          console.error(`[${vehicleId}] Auth failed: ${chunk.toString('hex')}`);
+          console.error(`[${vehicleId}] Auth failed: ${chunk.toString("hex")}`);
           client.end();
         }
         return;
@@ -98,15 +118,20 @@ class GhostFleetSimulator {
       ackBuffer = Buffer.concat([ackBuffer, chunk]);
       while (ackBuffer.length >= 4) {
         const recordCount = ackBuffer.readUInt32BE(0);
-        console.log(`[${vehicleId}] Server ACK: ${recordCount} records confirmed`);
+        console.log(
+          `[${vehicleId}] Server ACK: ${recordCount} records confirmed`,
+        );
         ackBuffer = ackBuffer.slice(4);
       }
     });
 
-    client.on('close', () => {
+    client.on("close", () => {
+      sessionActive = false;
       this.authenticated = false;
       if (reconnectTest && sessionCount >= 2) {
-        console.log(`[${vehicleId}] reconnect-test: ${packetsPerSession * 2} packets sent across 2 sessions — verify Supabase row count`);
+        console.log(
+          `[${vehicleId}] reconnect-test: ${packetsPerSession * 2} packets sent across 2 sessions — verify Supabase row count`,
+        );
         process.exit(0);
       }
       if (this.running) {
@@ -115,7 +140,7 @@ class GhostFleetSimulator {
       }
     });
 
-    client.on('error', (err) => {
+    client.on("error", (err) => {
       console.error(`[${vehicleId}] Connection error:`, err.message);
       if (this.running) {
         setTimeout(() => this.runSimulation(), intervalMs);
@@ -124,18 +149,22 @@ class GhostFleetSimulator {
 
     // Schedule next telemetry at interval
     const scheduleNext = () => {
-      if (!this.running || !this.authenticated) return;
+      if (!this.running || !this.authenticated || !sessionActive) return;
 
       setTimeout(() => {
-        if (!this.running || !this.authenticated) return;
+        if (!this.running || !this.authenticated || !sessionActive) return;
         const data = this.generateSimulatedData();
         const packet = this.buildCodec8ExtendedPacket(data);
         client.write(packet);
         packetsSentThisSession++;
-        console.log(`[${vehicleId}] Sent telemetry: temp=${data.temp}°C, voltage=${data.voltage}V, rpm=${data.rpm}, speed=${data.speed}km/h`);
+        console.log(
+          `[${vehicleId}] Sent telemetry: temp=${data.temp}°C, voltage=${data.voltage}V, rpm=${data.rpm}, speed=${data.speed}km/h`,
+        );
 
         if (reconnectTest && packetsSentThisSession >= packetsPerSession) {
-          console.log(`[${vehicleId}] reconnect-test: session ${sessionCount} closed after ${packetsSentThisSession} packets`);
+          console.log(
+            `[${vehicleId}] reconnect-test: session ${sessionCount} closed after ${packetsSentThisSession} packets`,
+          );
           client.destroy();
           return;
         }
@@ -181,7 +210,7 @@ class GhostFleetSimulator {
       speed: Math.floor(30 + Math.random() * 50),
       voltage,
       temp: Math.floor(temp),
-      rpm: Math.floor(rpm)
+      rpm: Math.floor(rpm),
     };
   }
 
@@ -189,7 +218,7 @@ class GhostFleetSimulator {
     const timestamp = BigInt(Date.now());
     const latInt = Math.floor(data.lat * 10_000_000);
     const lngInt = Math.floor(data.lng * 10_000_000);
-    const speedInt = data.speed * 10; // km/h × 10
+    const speedInt = data.speed * 10; // AVL fixed header speed field (km/h × 10 per Teltonika fixed block spec)
     const voltageMv = Math.floor(data.voltage * 1000);
     const tempX10 = Math.floor(data.temp * 10);
 
@@ -227,7 +256,7 @@ class GhostFleetSimulator {
     const ioData = Buffer.concat(ioElements);
     const ioCount = 4; // number of IO elements
 
-    // Fixed AVL record (28 bytes)
+    // Fixed AVL record header (29 bytes)
     const avlFixed = Buffer.alloc(29);
     avlFixed.writeBigUInt64BE(timestamp, 0);
     avlFixed[8] = 0; // priority
@@ -243,23 +272,23 @@ class GhostFleetSimulator {
     const avlRecord = Buffer.concat([avlFixed, ioData]);
 
     // Build payload: codec ID + num records + AVL records + num records repeat
-    const header = Buffer.alloc(3);
-    header[0] = 0x8E; // codec ID
-    header.writeUInt16BE(1, 1); // num records
+    const header = Buffer.alloc(2);
+    header[0] = 0x8e; // codec ID
+    header[1] = 0x01; // num records
 
-    const trailer = Buffer.alloc(2);
-    trailer.writeUInt16BE(1, 0); // num records repeat
+    const trailer = Buffer.alloc(1);
+    trailer[0] = 0x01; // num records repeat
 
     const payload = Buffer.concat([header, avlRecord, trailer]);
 
-    // CRC-16 over payload
+    // CRC-16/IBM over payload
     const crc = crc16(payload);
     const crcBuf = Buffer.alloc(2);
     crcBuf.writeUInt16BE(crc, 0);
 
     // Full packet: preamble + length + payload + CRC
     const preamble = Buffer.from([0x00, 0x00, 0x00, 0x00]);
-    const dataLength = payload.length + 2; // payload + CRC
+    const dataLength = payload.length; // CRC is appended outside the Data Field Length per Teltonika spec
     const lengthBuf = Buffer.alloc(4);
     lengthBuf.writeUInt32BE(dataLength, 0);
 
@@ -268,28 +297,38 @@ class GhostFleetSimulator {
 }
 
 // Configuration from environment
-const config: SimulatorConfig = {
-  host: process.env.PARSER_HOST || 'localhost',
-  port: parseInt(process.env.PARSER_PORT || '5050', 10),
-  vehicleId: process.env.VEHICLE_ID || 'ghost-vehicle-01',
-  imei: process.env.DEVICE_IMEI || '359632098765432',
-  intervalMs: parseInt(process.env.SEND_INTERVAL_MS || '5000', 10),
-  latitude: parseFloat(process.env.LATITUDE || '37.7749'),
-  longitude: parseFloat(process.env.LONGITUDE || '-122.4194'),
-  reconnectTest: process.env.RECONNECT_TEST === 'true',
-  packetsPerSession: parseInt(process.env.PACKETS_PER_SESSION || '5', 10)
-};
+let config: SimulatorConfig;
+try {
+  config = {
+    host: process.env.PARSER_HOST || "localhost",
+    port: requireInt(process.env.PARSER_PORT, 5050, "PARSER_PORT"),
+    vehicleId: process.env.VEHICLE_ID || "ghost-vehicle-01",
+    imei: process.env.DEVICE_IMEI || "359632098765432",
+    intervalMs: requireInt(process.env.SEND_INTERVAL_MS, 5000, "SEND_INTERVAL_MS"),
+    latitude: requireFloat(process.env.LATITUDE, 37.7749, "LATITUDE"),
+    longitude: requireFloat(process.env.LONGITUDE, -122.4194, "LONGITUDE"),
+    reconnectTest: process.env.RECONNECT_TEST === "true",
+    packetsPerSession: requireInt(process.env.PACKETS_PER_SESSION, 5, "PACKETS_PER_SESSION"),
+  };
+} catch (err) {
+  console.error("Configuration error:", (err as Error).message);
+  process.exit(1);
+}
 
 // Start simulator
 const simulator = new GhostFleetSimulator(config);
 simulator.start();
-console.log('Emitting FMC003 IO IDs: 7059(voltage mV), 7040(temp °C×10), 7044(rpm), 7045(speed km/h)');
+console.log(
+  "Emitting FMC003 IO IDs: 7059(voltage mV), 7040(temp °C×10), 7044(rpm), 7045(speed km/h)",
+);
 if (config.reconnectTest) {
-  console.log(`[${config.vehicleId}] RECONNECT_TEST mode: ${config.packetsPerSession} packets × 2 sessions = ${config.packetsPerSession * 2} total expected in Supabase`);
+  console.log(
+    `[${config.vehicleId}] RECONNECT_TEST mode: ${config.packetsPerSession} packets × 2 sessions = ${config.packetsPerSession * 2} total expected in Supabase`,
+  );
 }
 
 // Handle graceful shutdown
-process.on('SIGINT', () => {
+process.on("SIGINT", () => {
   simulator.stop();
   process.exit(0);
 });
